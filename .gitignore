@@ -255,3 +255,8 @@ cabal.project.local*
 
 zz-misc/
 vue-implementation/
+
+
+#VENV
+
+.venv-meta3/

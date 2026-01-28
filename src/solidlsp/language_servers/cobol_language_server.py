@@ -1,13 +1,18 @@
+import logging
 import os
-from pathlib import Path
-from typing import List
+import pathlib
+import threading
+from typing import Any
 
-from solidlsp.language_servers.base import SolidLanguageServer
-from solidlsp.dependency_providers import (
-    LanguageServerDependencyProviderSinglePath
-)
-from solidlsp.utils import PathUtils
+from solidlsp.language_servers.common import RuntimeDependency, RuntimeDependencyCollection
+from solidlsp.ls import SolidLanguageServer
+from solidlsp.ls_config import LanguageServerConfig
+from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
+from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
+from solidlsp.settings import SolidLSPSettings
+from solidlsp.ls_utils import PathUtils
 
+log = logging.getLogger(__name__)
 
 # ============================================================================
 # Che4z COBOL Language Server configuration
@@ -25,116 +30,124 @@ CHE4Z_VSIX_URL = (
 CHE4Z_VSIX_FILENAME = f"cobol-language-support-{CHE4Z_VERSION}.vsix"
 
 
-# ============================================================================
-# COBOL Language Server
-# ============================================================================
-
 class CobolLanguageServer(SolidLanguageServer):
     """
     Serena integration for COBOL using Eclipse Che4z COBOL Language Server.
-
-    This implementation:
-      - Downloads the Che4z VSIX (Java-based)
-      - Extracts it into Serena's LS resources directory
-      - Locates the actual LSP server JAR dynamically
-      - Launches the server via stdio
     """
 
-    # ----------------------------------------------------------------------
-    # Dependency Provider
-    # ----------------------------------------------------------------------
-    class DependencyProvider(LanguageServerDependencyProviderSinglePath):
-        """
-        Handles download, extraction and launch command creation
-        for the Che4z COBOL Language Server.
-        """
+    def __init__(
+        self,
+        config: LanguageServerConfig,
+        repository_root_path: str,
+        solidlsp_settings: SolidLSPSettings,
+    ):
+        cmd = self._setup_runtime_dependencies(solidlsp_settings)
 
-        def _get_or_install_core_dependency(self) -> Path:
-            """
-            Downloads and extracts the Che4z VSIX if not already present.
-
-            Returns:
-                Path: Root directory of the extracted VSIX.
-            """
-            return self._download_if_needed(
-                url=CHE4Z_VSIX_URL,
-                filename=CHE4Z_VSIX_FILENAME,
-                extract=True
-            )
-
-        # ------------------------------------------------------------------
-        # JAR discovery helpers
-        # ------------------------------------------------------------------
-        def _find_server_jar(self, core_path: Path) -> Path:
-            """
-            Locate the COBOL LSP server JAR inside the extracted VSIX.
-
-            Strategy:
-              1. Prefer jars under extension/server/
-              2. If multiple, pick the largest (usually the executable server)
-              3. Fallback to searching the entire VSIX tree
-
-            Raises:
-                RuntimeError: If no suitable JAR is found.
-            """
-            server_dir = core_path / "extension" / "server"
-
-            if server_dir.exists():
-                jars = list(server_dir.rglob("*.jar"))
-                if jars:
-                    return max(jars, key=lambda p: p.stat().st_size)
-
-            # Fallback: search everywhere
-            all_jars = list(core_path.rglob("*.jar"))
-            if not all_jars:
-                raise RuntimeError(
-                    "COBOL LSP JAR not found inside extracted Che4z VSIX"
-                )
-
-            return max(all_jars, key=lambda p: p.stat().st_size)
-
-        # ------------------------------------------------------------------
-        # Launch command
-        # ------------------------------------------------------------------
-        def _create_launch_command(self, core_path: Path) -> List[str]:
-            """
-            Build the command used to start the COBOL language server.
-            """
-            jar_path = self._find_server_jar(core_path)
-
-            return [
-                "java",
-                "-jar",
-                str(jar_path),
-                "--stdio"
-            ]
-
-    # ----------------------------------------------------------------------
-    # SolidLanguageServer hooks
-    # ----------------------------------------------------------------------
-    def _create_dependency_provider(self):
-        """
-        Instantiate the DependencyProvider for this server.
-        """
-        return self.DependencyProvider(
-            self._custom_settings,
-            self._ls_resources_dir
+        super().__init__(
+            config,
+            repository_root_path,
+            ProcessLaunchInfo(cmd=cmd, cwd=repository_root_path),
+            "cobol",
+            solidlsp_settings,
         )
 
-    def _get_initialize_params(self):
-        """
-        Provide language-server-specific initialization parameters.
-        """
-        root_uri = PathUtils.path_to_uri(self.repository_root_path)
+        self.server_ready = threading.Event()
 
+    # ------------------------------------------------------------------
+    # Runtime dependencies
+    # ------------------------------------------------------------------
+    @classmethod
+    def _setup_runtime_dependencies(cls, solidlsp_settings: SolidLSPSettings) -> list[str]:
+        """
+        Download and prepare the Che4z COBOL Language Server.
+        """
+        deps = RuntimeDependencyCollection(
+            [
+                RuntimeDependency(
+                    id="che4z-cobol",
+                    description="Eclipse Che4z COBOL Language Server",
+                    url=CHE4Z_VSIX_URL,
+                    archive_type="zip",
+                    platform_id="any",
+                )
+            ]
+        )
+
+        ls_dir = pathlib.Path(cls.ls_resources_dir(solidlsp_settings)) / "cobol"
+        ls_dir.mkdir(parents=True, exist_ok=True)
+
+        vsix_path = ls_dir / CHE4Z_VSIX_FILENAME
+
+        if not vsix_path.exists():
+            log.info("Downloading Che4z COBOL language server VSIX")
+            deps.install(str(ls_dir))
+
+        jar_path = cls._find_server_jar(ls_dir)
+        jar_dir = jar_path.parent
+
+        classpath = str(jar_dir / "*")
+
+        # 🔑 ENTRYPOINT CORRETO DO CHE4Z
+        return [
+            "java",
+            "-cp",
+            classpath,
+            "org.eclipse.lsp.cobol.cli.CobolLanguageServerLauncher",
+        ]
+
+    @staticmethod
+    def _find_server_jar(base_dir: pathlib.Path) -> pathlib.Path:
+        """
+        Locate the COBOL LSP server JAR inside the extracted VSIX.
+        """
+        jars = list(base_dir.rglob("*.jar"))
+        if not jars:
+            raise RuntimeError("COBOL LSP server JAR not found after extraction")
+
+        # pick the largest JAR (actual server)
+        return max(jars, key=lambda p: p.stat().st_size)
+
+    # ------------------------------------------------------------------
+    # LSP initialization
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _get_initialize_params(repository_absolute_path: str) -> InitializeParams:
+        root_uri = PathUtils.path_to_uri(repository_absolute_path)
         return {
             "processId": os.getpid(),
             "rootUri": root_uri,
             "workspaceFolders": [
                 {
                     "uri": root_uri,
-                    "name": "cobol-workspace"
+                    "name": pathlib.Path(repository_absolute_path).name,
                 }
             ],
-            "capabilities": {}
+            "capabilities": {},
         }
+
+    def _start_server(self) -> None:
+        """
+        Start the COBOL language server and complete initialization.
+        """
+
+        def window_log_message(msg: dict) -> None:
+            log.info(f"LSP[cobol]: {msg}")
+
+        def do_nothing(_: Any) -> None:
+            return
+
+        self.server.on_notification("window/logMessage", window_log_message)
+        self.server.on_notification("$/progress", do_nothing)
+        self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
+
+        log.info("Starting COBOL language server process")
+        self.server.start()
+
+        init_params = self._get_initialize_params(self.repository_root_path)
+        init_response = self.server.send.initialize(init_params)
+
+        log.debug(f"COBOL initialize response: {init_response}")
+
+        self.server.notify.initialized({})
+        self.server_ready.set()
+        self.completions_available.set()
