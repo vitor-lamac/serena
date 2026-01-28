@@ -101,6 +101,12 @@ class Language(str, Enum):
     Supports TOML validation, formatting, and schema support.
     """
 
+    # Experimental languages
+    COBOL = "cobol"
+    """COBOL language server (experimental).
+    Must be explicitly specified as the main language, not auto-detected.
+    """
+
     @classmethod
     def iter_all(cls, include_experimental: bool = False) -> Iterable[Self]:
         for lang in cls:
@@ -124,6 +130,7 @@ class Language(str, Enum):
             self.YAML,
             self.TOML,
             self.GROOVY,
+            self.COBOL,
         }
 
     def __str__(self) -> str:
@@ -239,8 +246,11 @@ class Language(str, Enum):
                 return FilenameMatcher("*.groovy", "*.gvy")
             case self.MATLAB:
                 return FilenameMatcher("*.m", "*.mlx", "*.mlapp")
+            case self.COBOL:
+                return FilenameMatcher("*.cbl", "*.cob", "*.cpy", "*.jcl")
             case _:
                 raise ValueError(f"Unhandled language: {self}")
+
 
     def get_ls_class(self) -> type["SolidLanguageServer"]:
         match self:
@@ -412,6 +422,10 @@ class Language(str, Enum):
                 from solidlsp.language_servers.matlab_language_server import MatlabLanguageServer
 
                 return MatlabLanguageServer
+            case self.COBOL:
+                from solidlsp.language_servers.cobol_language_server import CobolLanguageServer
+
+                return CobolLanguageServer
             case _:
                 raise ValueError(f"Unhandled language: {self}")
 
